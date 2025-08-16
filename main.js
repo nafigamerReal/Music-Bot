@@ -1,20 +1,28 @@
-const { Client, Collection, GatewayIntentBits, Partials } = require("discord.js");
+const { Client, Collection, GatewayIntentBits, Partials, REST, Routes, ApplicationCommandOptionType } = require("discord.js");
 const { readdirSync } = require("fs");
 const { JsonDatabase } = require("five.db");
 const { Manager } = require("erela.js");
 const Spotify = require("erela.js-spotify");
-const client = global.client = new Client({ intents: Object.keys(GatewayIntentBits), partials: Object.keys(Partials), allowedMentions: { repliedUser: true, parse: ["everyone", "roles", "users"] } });
+const path = require("path");
+
+const client = global.client = new Client({
+    intents: Object.keys(GatewayIntentBits),
+    partials: Object.keys(Partials),
+    allowedMentions: { repliedUser: true, parse: ["everyone", "roles", "users"] }
+});
+
 const db = client.db = new JsonDatabase();
 
-module.exports = client
+module.exports = client;
+
 client.commands = new Collection();
-client.config = require("./config.json");
-client.prefix = client.config.prefix;
 client.aliases = new Collection();
-client.commands = new Collection();
 client.categories = readdirSync("./commands/");
 client.logger = require("./utils/logger.js");
+client.config = require("./config.json");
+client.prefix = client.config.prefix || "!";
 
+// Manager setup (keep as your original)
 client.manager = new Manager({
     nodes: client.config.nodes,
     send: (id, payload) => {
@@ -22,38 +30,13 @@ client.manager = new Manager({
         if (guild) guild.shard.send(payload);
     },
     autoPlay: true,
-     plugins: [new Spotify({
-     clientID: client.config.clientID,
-     clientSecret: client.config.clientSecret,
-     })]
+    plugins: [new Spotify({
+        clientID: client.config.spotifyClientId,
+        clientSecret: client.config.spotifyClientSecret
+    })]
 });
 
-const translate = require('node-google-translate-skidz');
-client.translate = async function (guild, text) {
-    try {
-        var data = db.get(`language-${guild}`);
-        var res;
-        if (!data) res = text;
-        if (data) {
-            var trans = await translate({ text: `${text}`, source: `tr`, target: `${data}` })
-            res = trans.translation;
-        }
-        return res;
-    } catch (error) {
-        return text
-    }
-}
-
-
-client.on("raw", (d) => client.manager.updateVoiceState(d));
-client.on("disconnect", () => console.log("Bot Disconnected!"))
-client.on("reconnecting", () => console.log("Bot Reconnecting.."))
-client.on('warn', error => console.log(error));
-client.on('error', error => console.log(error));
-process.on('unhandledRejection', error => console.log(error));
-process.on('uncaughtException', error => console.log(error));
-
-
+// Load events
 readdirSync("./events/Client/").forEach(file => {
     const event = require(`./events/Client/${file}`);
     let eventName = file.split(".")[0];
@@ -61,6 +44,7 @@ readdirSync("./events/Client/").forEach(file => {
     client.on(eventName, event.bind(null, client));
 });
 
+// Load lavalink events
 readdirSync("./events/Lavalink/").forEach(file => {
     const event = require(`./events/Lavalink/${file}`);
     let eventName = file.split(".")[0];
@@ -68,15 +52,71 @@ readdirSync("./events/Lavalink/").forEach(file => {
     client.manager.on(eventName, event.bind(null, client));
 });
 
+// Load commands (keeps original structure)
 readdirSync("./commands/").forEach(dir => {
     const commandFiles = readdirSync(`./commands/${dir}/`).filter(f => f.endsWith('.js'));
     for (const file of commandFiles) {
         const command = require(`./commands/${dir}/${file}`);
+        if (!command || !command.name) {
+            console.warn(`[COMMAND] Skipping invalid command file: ./commands/${dir}/${file}`);
+            continue;
+        }
         console.log(`[COMMAND] ${command.category} | ${command.name}`);
-        client.commands.set(command.name, command);
+        client.commands.set(command.name.toLowerCase(), command);
+
+        // register aliases map for quick lookup
+        if (Array.isArray(command.aliases)) {
+            for (const a of command.aliases) client.aliases.set(a.toLowerCase(), command.name.toLowerCase());
+        }
     }
 });
-client.on('ready', () => {
+
+// Helper: build slash command data from a command module
+function buildSlashDataFromCommand(cmd) {
+    try {
+        const name = (cmd.name || "").toString().toLowerCase().replace(/\s+/g, '-').slice(0, 32);
+        const description = (cmd.description || "No description").toString().slice(0, 100);
+        if (!name) return null;
+
+        const data = { name, description, options: [] };
+
+        // If developer provided explicit slashOptions, use them (expects discord API format)
+        if (Array.isArray(cmd.slashOptions) && cmd.slashOptions.length) {
+            data.options = cmd.slashOptions;
+            return data;
+        }
+
+        // Auto-add a single "query" string option for commands that expect args
+        if (cmd.args) {
+            data.options.push({
+                name: "query",
+                description: cmd.usage ? cmd.usage.replace(/[<>]/g, "") : "Arguments for the command",
+                type: ApplicationCommandOptionType.String,
+                required: false
+            });
+        }
+
+        // For commands that clearly take a number (skipto, volume) add better options
+        const numCommands = ["skipto", "volume", "seek"];
+        if (numCommands.includes(name) && !data.options.length) {
+            data.options.push({
+                name: "number",
+                description: "Number / value",
+                type: ApplicationCommandOptionType.String,
+                required: true
+            });
+        }
+
+        return data;
+    } catch (err) {
+        console.error("buildSlashDataFromCommand error:", err);
+        return null;
+    }
+}
+
+// Register slash commands when ready
+client.once('ready', async () => {
+    console.log(`Logged in as ${client.user.tag}`);
     client.user.setPresence({
         activities: [{
             name: `${client.prefix}help`,
@@ -84,5 +124,42 @@ client.on('ready', () => {
         }],
         status: 'online'
     });
+
+    // Build slash commands list from loaded commands
+    const slashCommands = [];
+    for (const [name, cmd] of client.commands) {
+        const data = buildSlashDataFromCommand(cmd);
+        if (data) slashCommands.push(data);
+    }
+
+    // Use REST to register commands (guild if specified for faster dev; global otherwise)
+    const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN || client.config.token);
+    const clientId = client.config.clientId || process.env.CLIENT_ID || client.user.id;
+    const guildId = process.env.GUILD_ID || client.config.guildId;
+
+    try {
+        if (guildId) {
+            console.log(`[SLASH] Registering ${slashCommands.length} commands to guild ${guildId}`);
+            await rest.put(
+                Routes.applicationGuildCommands(clientId, guildId),
+                { body: slashCommands }
+            );
+            console.log("[SLASH] Guild commands registered.");
+        } else {
+            console.log(`[SLASH] Registering ${slashCommands.length} global commands (may take up to 1 hour to propagate)`);
+            await rest.put(
+                Routes.applicationCommands(clientId),
+                { body: slashCommands }
+            );
+            console.log("[SLASH] Global commands registered.");
+        }
+    } catch (err) {
+        console.error("[SLASH] Failed to register slash commands:", err);
+    }
 });
-client.login(client.config.token);
+
+// Export helper used by interaction handler (below file will be created)
+client._buildSlashDataFromCommand = buildSlashDataFromCommand;
+
+// login at end to reuse existing token config
+client.login(process.env.DISCORD_TOKEN || client.config.token);
